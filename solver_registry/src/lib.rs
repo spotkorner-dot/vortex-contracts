@@ -21,8 +21,8 @@
 //! test module is the shared cross-check.
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, Env,
-    Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, BytesN,
+    Env, Symbol, Vec,
 };
 
 #[cfg(test)]
@@ -99,6 +99,10 @@ pub enum DataKey {
     TotalSolvers,
     /// Persistent: per-solver record.
     Solver(Address),
+    /// Persistent: presence means the write `action` (`fill`, `failure` or
+    /// `slash`) was already applied for `intent_id` (issue #390). Makes each
+    /// settlement write exactly-once per intent.
+    Recorded(Symbol, BytesN<32>),
 }
 
 /// One row of the tunable part of the tier table.
@@ -167,6 +171,8 @@ pub enum Error {
     /// `record_fill` / `record_failure` / `slash` called before `set_writer`
     /// with a caller that is not the admin.
     WriterNotSet = 12,
+    /// This write was already applied for this `intent_id` (issue #390).
+    AlreadyRecorded = 13,
 }
 
 // ─── Reputation formula ──────────────────────────────────────────────────────
@@ -453,14 +459,22 @@ impl SolverRegistry {
 
     // ── Settlement write path (writer or admin) ─────────────────────────────
 
-    /// Record a successful fill of `amount` (dst-token units) by `solver`.
-    /// `caller` must be the configured writer or the admin.
-    pub fn record_fill(env: Env, caller: Address, solver: Address, amount: i128) {
+    /// Record a successful fill of `amount` (dst-token units) by `solver`
+    /// for `intent_id`. `caller` must be the configured writer or the admin.
+    /// Exactly once per intent: a repeat fails with `AlreadyRecorded`.
+    pub fn record_fill(
+        env: Env,
+        caller: Address,
+        solver: Address,
+        intent_id: BytesN<32>,
+        amount: i128,
+    ) {
         Self::require_writer_or_admin(&env, &caller);
         if amount < 0 {
             panic_with_error!(&env, Error::ZeroAmount);
         }
         let mut record = Self::load_solver(&env, &solver);
+        Self::mark_recorded(&env, "fill", &intent_id);
         record.fills_completed += 1;
         record.total_volume += amount;
         env.storage()
@@ -473,11 +487,13 @@ impl SolverRegistry {
         );
     }
 
-    /// Record a failed fill by `solver` (no slash — that is `slash`).
-    /// `caller` must be the configured writer or the admin.
-    pub fn record_failure(env: Env, caller: Address, solver: Address) {
+    /// Record a failed fill by `solver` for `intent_id` (no slash — that is
+    /// `slash`). `caller` must be the configured writer or the admin.
+    /// Exactly once per intent: a repeat fails with `AlreadyRecorded`.
+    pub fn record_failure(env: Env, caller: Address, solver: Address, intent_id: BytesN<32>) {
         Self::require_writer_or_admin(&env, &caller);
         let mut record = Self::load_solver(&env, &solver);
+        Self::mark_recorded(&env, "failure", &intent_id);
         record.fills_failed += 1;
         env.storage()
             .persistent()
@@ -493,10 +509,12 @@ impl SolverRegistry {
     /// unit), transfer it to the fee recipient, and record a failed fill.
     ///
     /// Returns `(slash_amount, new_tier)`. `caller` must be the configured
-    /// writer or the admin.
-    pub fn slash(env: Env, caller: Address, solver: Address) -> (i128, u32) {
+    /// writer or the admin. Exactly once per `intent_id`: a repeat fails with
+    /// `AlreadyRecorded`, so a retry can't double-slash.
+    pub fn slash(env: Env, caller: Address, solver: Address, intent_id: BytesN<32>) -> (i128, u32) {
         Self::require_writer_or_admin(&env, &caller);
         let mut record = Self::load_solver(&env, &solver);
+        Self::mark_recorded(&env, "slash", &intent_id);
 
         let tier_before = Self::tier_of(&env, &record);
         let bps = SLASH_BPS[tier_before as usize] as i128;
@@ -537,6 +555,15 @@ impl SolverRegistry {
     }
 
     // ── Views ───────────────────────────────────────────────────────────────
+
+    /// `true` iff the write `action` (`fill`, `failure` or `slash`) was
+    /// already applied for `intent_id`, so settlement can check before
+    /// retrying.
+    pub fn is_intent_recorded(env: Env, action: Symbol, intent_id: BytesN<32>) -> bool {
+        env.storage()
+            .persistent()
+            .has(&DataKey::Recorded(action, intent_id))
+    }
 
     /// Current tier (0..=4) for `solver`. Unknown solver → 0.
     pub fn get_tier(env: Env, solver: Address) -> u32 {
@@ -714,6 +741,23 @@ impl SolverRegistry {
             }
         }
         caller.require_auth();
+    }
+
+    /// Claim the idempotency key for `action` on `intent_id`, failing with
+    /// `AlreadyRecorded` if that write was already applied. Keys are per
+    /// action, so e.g. `record_failure` and `slash` for the same intent are
+    /// independent writes.
+    fn mark_recorded(env: &Env, action: &str, intent_id: &BytesN<32>) {
+        let key = DataKey::Recorded(Symbol::new(env, action), intent_id.clone());
+        if env.storage().persistent().has(&key) {
+            panic_with_error!(env, Error::AlreadyRecorded);
+        }
+        env.storage().persistent().set(&key, &true);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
     }
 
     fn bump_instance_ttl(env: &Env) {
