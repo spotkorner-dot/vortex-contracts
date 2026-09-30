@@ -414,6 +414,22 @@ fn an_intent_fill_cannot_be_credited_to_a_second_solver() {
 }
 
 #[test]
+fn a_failed_write_does
+    let c = ctx.client();
+    let other = Address::generate(&ctx.env);
+    ctx.mint(&other, FLOOR);
+    c.register_solver(&other, &FLOOR);
+    let intent = next_intent(&ctx.env);
+
+    c.record_fill(&ctx.admin, &ctx.solver, &intent, &(10 * USDC));
+    assert_eq!(
+        c.try_record_fill(&ctx.admin, &other, &intent, &(10 * USDC)),
+        Err(Ok(Error::AlreadyRecorded.into()))
+    );
+    assert_eq!(c.get_solver(&other).unwrap().fills_completed, 0);
+}
+
+#[test]
 fn a_failed_write_does_not_consume_the_intent() {
     let ctx = setup();
     let c = ctx.client();
@@ -429,6 +445,75 @@ fn a_failed_write_does_not_consume_the_intent() {
     ctx.register(FLOOR);
     c.record_fill(&ctx.admin, &ctx.solver, &intent, &0);
     assert_eq!(c.get_solver(&ctx.solver).unwrap().fills_completed, 1);
+}
+
+#[test]
+fn obligation_path_accepts_only_the_writer() {
+    let ctx = setup();
+    ctx.register(FLOOR);
+    let c = ctx.client();
+    let a = intent(&ctx.env, 1);
+    let writer = Address::generate(&ctx.env);
+    let stranger = Address::generate(&ctx.env);
+
+    // No writer configured: even the admin is rejected.
+    assert_eq!(
+        c.try_lock_obligation(&ctx.admin, &ctx.solver, &a),
+        Err(Ok(Error::WriterNotSet.into()))
+    );
+    assert_eq!(
+        c.try_release_obligation(&ctx.admin, &ctx.solver, &a),
+        Err(Ok(Error::WriterNotSet.into()))
+    );
+
+    c.set_writer(&writer);
+    for caller in [&ctx.admin, &stranger] {
+        assert_eq!(
+            c.try_lock_obligation(caller, &ctx.solver, &a),
+            Err(Ok(Error::Unauthorized.into()))
+        );
+        assert_eq!(
+            c.try_release_obligation(caller, &ctx.solver, &a),
+            Err(Ok(Error::Unauthorized.into()))
+        );
+    }
+    assert_eq!(c.get_open_obligations(&ctx.solver), 0);
+}
+
+#[test]
+fn obligation_path_requires_writer_auth() {
+    let ctx = setup();
+    let writer = with_writer(&ctx);
+    let c = ctx.client();
+    // Drop the blanket auth mock: the writer has not signed.
+    ctx.env.set_auths(&[]);
+    assert!(c
+        .try_lock_obligation(&writer, &ctx.solver, &intent(&ctx.env, 1))
+        .is_err());
+    assert_eq!(c.get_open_obligations(&ctx.solver), 0);
+}
+
+#[test]
+fn lock_obligation_rejects_unregistered_solver() {
+    let ctx = setup();
+    let writer = with_writer(&ctx);
+    let unknown = Address::generate(&ctx.env);
+    assert_eq!(
+        ctx.client()
+            .try_lock_obligation(&writer, &unknown, &intent(&ctx.env, 1)),
+        Err(Ok(Error::SolverNotRegistered.into()))
+    );
+}
+
+#[test]
+fn obligations_are_scoped_per_solver() {
+    let ctx = setup();
+    let writer = with_writer(&ctx);
+    let c = ctx.client();
+    let other = Address::generate(&ctx.env);
+    ctx.mint(&other, FLOOR);
+    c.register_solver(&other, &FLOOR);
+
 }
 
 // ─── Tier demotion on slash ────────────────────────────────────────────────
